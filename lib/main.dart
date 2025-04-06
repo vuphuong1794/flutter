@@ -1,122 +1,342 @@
+import 'dart:convert';
+import 'dart:io' show File;
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
+import 'package:image_picker/image_picker.dart';
 
-void main() {
-  runApp(const MyApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Check if running on web
+  if (kIsWeb) {
+    runApp(const MyApp(camera: null));
+  } else {
+    final cameras = await availableCameras();
+    if (cameras.isEmpty) {
+      throw Exception('No cameras available on this device');
+    }
+    final firstCamera = cameras.first;
+    runApp(MyApp(camera: firstCamera));
+  }
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  final CameraDescription? camera;
 
-  // This widget is the root of your application.
+  const MyApp({super.key, required this.camera});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      title: 'Drowsiness Detection',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: DrowsinessDetector(camera: camera),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
+class DrowsinessDetector extends StatefulWidget {
+  final CameraDescription? camera;
 
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+  const DrowsinessDetector({super.key, required this.camera});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<DrowsinessDetector> createState() => _DrowsinessDetectorState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _DrowsinessDetectorState extends State<DrowsinessDetector> {
+  CameraController? _controller;
+  late Future<void> _initializeControllerFuture;
+  String _status = 'Initializing...';
+  String _processedImage = '';
+  bool _isDetecting = false;
+  Uint8List? _webImage; // For storing image data on web
 
-  void _incrementCounter() {
+  final String apiUrl = 'http://192.168.1.9:5000/api/detect_drowsiness';
+
+  @override
+  void initState() {
+    super.initState();
+
+    if (kIsWeb) {
+      _initializeControllerFuture = Future.value();
+      setState(() {
+        _status = 'Web platform detected. Using alternative camera access.';
+      });
+    } else {
+      _initializeControllerFuture = Future.value();
+      _initializeCamera();
+    }
+  }
+
+  Future<void> _initializeCamera() async {
+    if (widget.camera == null) return;
+
+    try {
+      _controller = CameraController(
+        widget.camera!,
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
+
+      _initializeControllerFuture = _controller!.initialize();
+      await _initializeControllerFuture;
+
+      if (_controller!.value.isInitialized) {
+        setState(() {
+          _status = 'Camera initialized';
+        });
+      } else {
+        setState(() {
+          _status = 'Error: Camera failed to initialize properly';
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _status = 'Error initializing camera: $e';
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
+  }
+
+  Future<Uint8List?> _getImageFromCamera() async {
+    final picker = ImagePicker();
+    final pickedFile = await picker.pickImage(source: ImageSource.camera);
+
+    if (pickedFile != null) {
+      if (kIsWeb) {
+        // For web, read the image as bytes
+        final bytes = await pickedFile.readAsBytes();
+        setState(() {
+          _webImage = bytes;
+          _status = 'Image captured';
+        });
+        return bytes;
+      } else {
+        // For mobile, read as bytes
+        final bytes = await pickedFile.readAsBytes();
+        return bytes;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _detectDrowsiness() async {
+    if (_isDetecting) {
+      setState(() {
+        _status = 'Detection already in progress';
+      });
+      return;
+    }
+
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _isDetecting = true;
+      _status = 'Detecting...';
+      _processedImage = '';
     });
+
+    try {
+      Uint8List? imageBytes;
+
+      if (kIsWeb) {
+        // Web platform - use ImagePicker
+        imageBytes = await _getImageFromCamera();
+        if (imageBytes == null) {
+          setState(() {
+            _status = 'No image captured';
+            _isDetecting = false;
+          });
+          return;
+        }
+      } else {
+        // Mobile platform - use Camera plugin
+        if (_controller == null || !_controller!.value.isInitialized) {
+          setState(() {
+            _status = 'Error: Camera is not initialized';
+            _isDetecting = false;
+          });
+          return;
+        }
+
+        await _initializeControllerFuture;
+
+        // Log camera state for debugging
+        debugPrint('Camera state before taking picture:');
+        debugPrint('isInitialized: ${_controller!.value.isInitialized}');
+        debugPrint('isPreviewPaused: ${_controller!.value.isPreviewPaused}');
+        debugPrint('isRecordingVideo: ${_controller!.value.isRecordingVideo}');
+        debugPrint('isTakingPicture: ${_controller!.value.isTakingPicture}');
+
+        // Attempt to take the picture
+        debugPrint('Attempting to take picture...');
+        final image = await _controller!.takePicture();
+        debugPrint('Picture taken successfully: ${image.path}');
+
+        // Convert image to bytes
+        imageBytes = await image.readAsBytes();
+      }
+
+      if (imageBytes != null) {
+        // Convert to base64 and send to API
+        final base64Image = base64Encode(imageBytes);
+
+        // Send to API
+        final response = await http.post(
+          Uri.parse(apiUrl),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'image': base64Image}),
+        );
+
+        if (response.statusCode == 200) {
+          final result = jsonDecode(response.body);
+          setState(() {
+            _status =
+                result['drowsy_detected']
+                    ? 'Drowsy Detected (Confidence: ${(result['confidence'] * 100).toStringAsFixed(2)}%)'
+                    : 'No Drowsiness Detected';
+            _processedImage = result['processed_image'] ?? '';
+          });
+        } else {
+          setState(() {
+            _status = 'API Error: ${response.statusCode}';
+          });
+        }
+      }
+    } catch (e) {
+      setState(() {
+        _status = 'Error during detection: $e';
+      });
+    } finally {
+      setState(() {
+        _isDetecting = false;
+      });
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('Drowsiness Detection'),
+        centerTitle: true,
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
+      body: SafeArea(
         child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+          children: [
+            Expanded(
+              child: kIsWeb ? _buildWebCameraView() : _buildNativeCameraView(),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                vertical: 8.0,
+                horizontal: 16.0,
+              ),
+              child: Text(
+                _status,
+                style: TextStyle(
+                  fontSize: 16,
+                  color: _status.contains('Error') ? Colors.red : Colors.black,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
+            if (_processedImage.isNotEmpty)
+              Container(
+                height: 200,
+                margin: const EdgeInsets.symmetric(horizontal: 16.0),
+                child: Image.memory(
+                  base64Decode(_processedImage),
+                  fit: BoxFit.cover,
+                  errorBuilder: (context, error, stackTrace) {
+                    return const Center(
+                      child: Text(
+                        'Error loading processed image',
+                        style: TextStyle(color: Colors.red),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: ElevatedButton(
+                onPressed: _isDetecting ? null : _detectDrowsiness,
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 32.0,
+                    vertical: 16.0,
+                  ),
+                ),
+                child: const Text(
+                  'Detect Drowsiness',
+                  style: TextStyle(fontSize: 16),
+                ),
+              ),
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
+    );
+  }
+
+  Widget _buildWebCameraView() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          if (_webImage != null)
+            SizedBox(
+              height: 300,
+              child: Image.memory(_webImage!, fit: BoxFit.contain),
+            )
+          else
+            const Icon(Icons.camera_alt, size: 100, color: Colors.grey),
+          const SizedBox(height: 20),
+          const Text(
+            'Click "Detect Drowsiness" to use the camera',
+            style: TextStyle(fontSize: 16),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildNativeCameraView() {
+    return FutureBuilder<void>(
+      future: _initializeControllerFuture,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.done) {
+          if (snapshot.hasError) {
+            return Center(
+              child: Text(
+                'Error: ${snapshot.error}',
+                style: const TextStyle(color: Colors.red),
+                textAlign: TextAlign.center,
+              ),
+            );
+          }
+          if (_controller == null || !_controller!.value.isInitialized) {
+            return const Center(
+              child: Text(
+                'Camera not initialized',
+                style: TextStyle(color: Colors.red),
+                textAlign: TextAlign.center,
+              ),
+            );
+          }
+          return CameraPreview(_controller!);
+        }
+        return const Center(child: CircularProgressIndicator());
+      },
     );
   }
 }
