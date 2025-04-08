@@ -1,33 +1,27 @@
 import 'dart:convert';
-import 'dart:io' show File;
-import 'dart:typed_data';
-import 'package:flutter/foundation.dart';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
-import 'package:image_picker/image_picker.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  final cameras = await availableCameras();
 
-  // Check if running on web
-  if (kIsWeb) {
-    runApp(const MyApp(camera: null));
-  } else {
-    final cameras = await availableCameras();
-    if (cameras.isEmpty) {
-      throw Exception('No cameras available on this device');
-    }
-    final firstCamera = cameras.first;
-    runApp(MyApp(camera: firstCamera));
-  }
+  // Tìm camera trước (front-facing camera)
+  final frontCamera = cameras.firstWhere(
+    (camera) => camera.lensDirection == CameraLensDirection.front,
+    orElse: () => throw Exception('No front camera found'),
+  );
+
+  runApp(MyApp(camera: frontCamera));
 }
 
 class MyApp extends StatelessWidget {
-  final CameraDescription? camera;
+  final CameraDescription camera;
 
-  const MyApp({super.key, required this.camera});
+  const MyApp({Key? key, required this.camera}) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
@@ -40,12 +34,12 @@ class MyApp extends StatelessWidget {
 }
 
 class DrowsinessDetector extends StatefulWidget {
-  final CameraDescription? camera;
+  final CameraDescription camera;
 
-  const DrowsinessDetector({super.key, required this.camera});
+  const DrowsinessDetector({Key? key, required this.camera}) : super(key: key);
 
   @override
-  State<DrowsinessDetector> createState() => _DrowsinessDetectorState();
+  _DrowsinessDetectorState createState() => _DrowsinessDetectorState();
 }
 
 class _DrowsinessDetectorState extends State<DrowsinessDetector> {
@@ -54,31 +48,20 @@ class _DrowsinessDetectorState extends State<DrowsinessDetector> {
   String _status = 'Initializing...';
   String _processedImage = '';
   bool _isDetecting = false;
-  Uint8List? _webImage; // For storing image data on web
 
-  final String apiUrl = 'http://192.168.1.9:5000/api/detect_drowsiness';
+  final String apiUrl = 'http://192.168.5.85:5000/api/detect_drowsiness';
 
   @override
   void initState() {
     super.initState();
-
-    if (kIsWeb) {
-      _initializeControllerFuture = Future.value();
-      setState(() {
-        _status = 'Web platform detected. Using alternative camera access.';
-      });
-    } else {
-      _initializeControllerFuture = Future.value();
-      _initializeCamera();
-    }
+    _initializeControllerFuture = Future.value();
+    _initializeCamera();
   }
 
   Future<void> _initializeCamera() async {
-    if (widget.camera == null) return;
-
     try {
       _controller = CameraController(
-        widget.camera!,
+        widget.camera,
         ResolutionPreset.medium,
         enableAudio: false,
       );
@@ -108,32 +91,20 @@ class _DrowsinessDetectorState extends State<DrowsinessDetector> {
     super.dispose();
   }
 
-  Future<Uint8List?> _getImageFromCamera() async {
-    final picker = ImagePicker();
-    final pickedFile = await picker.pickImage(source: ImageSource.camera);
-
-    if (pickedFile != null) {
-      if (kIsWeb) {
-        // For web, read the image as bytes
-        final bytes = await pickedFile.readAsBytes();
-        setState(() {
-          _webImage = bytes;
-          _status = 'Image captured';
-        });
-        return bytes;
-      } else {
-        // For mobile, read as bytes
-        final bytes = await pickedFile.readAsBytes();
-        return bytes;
-      }
-    }
-    return null;
-  }
-
   Future<void> _detectDrowsiness() async {
-    if (_isDetecting) {
+    if (_isDetecting || _controller == null) {
       setState(() {
-        _status = 'Detection already in progress';
+        _status =
+            _controller == null
+                ? 'Camera not initialized. Please wait or restart the app.'
+                : 'Detection already in progress';
+      });
+      return;
+    }
+
+    if (!_controller!.value.isInitialized) {
+      setState(() {
+        _status = 'Error: Camera is not initialized';
       });
       return;
     }
@@ -145,76 +116,62 @@ class _DrowsinessDetectorState extends State<DrowsinessDetector> {
     });
 
     try {
-      Uint8List? imageBytes;
+      await _initializeControllerFuture;
 
-      if (kIsWeb) {
-        // Web platform - use ImagePicker
-        imageBytes = await _getImageFromCamera();
-        if (imageBytes == null) {
-          setState(() {
-            _status = 'No image captured';
-            _isDetecting = false;
-          });
-          return;
-        }
-      } else {
-        // Mobile platform - use Camera plugin
-        if (_controller == null || !_controller!.value.isInitialized) {
-          setState(() {
-            _status = 'Error: Camera is not initialized';
-            _isDetecting = false;
-          });
-          return;
-        }
+      // Log camera state for debugging
+      debugPrint('Camera state before taking picture:');
+      debugPrint('isInitialized: ${_controller!.value.isInitialized}');
+      debugPrint('isPreviewPaused: ${_controller!.value.isPreviewPaused}');
+      debugPrint('isRecordingVideo: ${_controller!.value.isRecordingVideo}');
+      debugPrint('isTakingPicture: ${_controller!.value.isTakingPicture}');
 
-        await _initializeControllerFuture;
-
-        // Log camera state for debugging
-        debugPrint('Camera state before taking picture:');
-        debugPrint('isInitialized: ${_controller!.value.isInitialized}');
-        debugPrint('isPreviewPaused: ${_controller!.value.isPreviewPaused}');
-        debugPrint('isRecordingVideo: ${_controller!.value.isRecordingVideo}');
-        debugPrint('isTakingPicture: ${_controller!.value.isTakingPicture}');
-
-        // Attempt to take the picture
-        debugPrint('Attempting to take picture...');
-        final image = await _controller!.takePicture();
-        debugPrint('Picture taken successfully: ${image.path}');
-
-        // Convert image to bytes
-        imageBytes = await image.readAsBytes();
+      // Ensure the camera preview is active
+      if (_controller!.value.isPreviewPaused) {
+        debugPrint('Resuming camera preview...');
+        await _controller!.resumePreview();
       }
 
-      if (imageBytes != null) {
-        // Convert to base64 and send to API
-        final base64Image = base64Encode(imageBytes);
+      // Attempt to take the picture
+      debugPrint('Attempting to take picture...');
+      final image = await _controller!.takePicture();
+      debugPrint('Picture taken successfully: ${image.path}');
 
-        // Send to API
-        final response = await http.post(
-          Uri.parse(apiUrl),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'image': base64Image}),
-        );
+      // Convert image to base64
+      final bytes = await File(image.path).readAsBytes();
+      final base64Image = base64Encode(bytes);
 
-        if (response.statusCode == 200) {
-          final result = jsonDecode(response.body);
-          setState(() {
-            _status =
-                result['drowsy_detected']
-                    ? 'Drowsy Detected (Confidence: ${(result['confidence'] * 100).toStringAsFixed(2)}%)'
-                    : 'No Drowsiness Detected';
-            _processedImage = result['processed_image'] ?? '';
-          });
-        } else {
-          setState(() {
-            _status = 'API Error: ${response.statusCode}';
-          });
-        }
+      // Send to API
+      final response = await http.post(
+        Uri.parse(apiUrl),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'image': base64Image}),
+      );
+
+      if (response.statusCode == 200) {
+        final result = jsonDecode(response.body);
+        setState(() {
+          _status =
+              result['drowsy_detected']
+                  ? 'Drowsy Detected (Confidence: ${(result['confidence'] * 100).toStringAsFixed(2)}%)'
+                  : 'No Drowsiness Detected';
+          _processedImage = result['processed_image'] ?? '';
+        });
+      } else {
+        setState(() {
+          _status = 'API Error: ${response.statusCode}';
+        });
       }
     } catch (e) {
-      setState(() {
-        _status = 'Error during detection: $e';
-      });
+      if (e.toString().contains('Unsupported operation: _Namespace')) {
+        setState(() {
+          _status =
+              'Error: Camera operation failed (Unsupported operation: _Namespace). Try restarting the app or using a different device.';
+        });
+      } else {
+        setState(() {
+          _status = 'Error during detection: $e';
+        });
+      }
     } finally {
       setState(() {
         _isDetecting = false;
@@ -233,7 +190,34 @@ class _DrowsinessDetectorState extends State<DrowsinessDetector> {
         child: Column(
           children: [
             Expanded(
-              child: kIsWeb ? _buildWebCameraView() : _buildNativeCameraView(),
+              child: FutureBuilder<void>(
+                future: _initializeControllerFuture,
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState == ConnectionState.done) {
+                    if (snapshot.hasError) {
+                      return Center(
+                        child: Text(
+                          'Error: ${snapshot.error}',
+                          style: const TextStyle(color: Colors.red),
+                          textAlign: TextAlign.center,
+                        ),
+                      );
+                    }
+                    if (_controller == null ||
+                        !_controller!.value.isInitialized) {
+                      return const Center(
+                        child: Text(
+                          'Camera not initialized',
+                          style: TextStyle(color: Colors.red),
+                          textAlign: TextAlign.center,
+                        ),
+                      );
+                    }
+                    return CameraPreview(_controller!);
+                  }
+                  return const Center(child: CircularProgressIndicator());
+                },
+              ),
             ),
             Padding(
               padding: const EdgeInsets.symmetric(
@@ -285,58 +269,6 @@ class _DrowsinessDetectorState extends State<DrowsinessDetector> {
           ],
         ),
       ),
-    );
-  }
-
-  Widget _buildWebCameraView() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          if (_webImage != null)
-            SizedBox(
-              height: 300,
-              child: Image.memory(_webImage!, fit: BoxFit.contain),
-            )
-          else
-            const Icon(Icons.camera_alt, size: 100, color: Colors.grey),
-          const SizedBox(height: 20),
-          const Text(
-            'Click "Detect Drowsiness" to use the camera',
-            style: TextStyle(fontSize: 16),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildNativeCameraView() {
-    return FutureBuilder<void>(
-      future: _initializeControllerFuture,
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.done) {
-          if (snapshot.hasError) {
-            return Center(
-              child: Text(
-                'Error: ${snapshot.error}',
-                style: const TextStyle(color: Colors.red),
-                textAlign: TextAlign.center,
-              ),
-            );
-          }
-          if (_controller == null || !_controller!.value.isInitialized) {
-            return const Center(
-              child: Text(
-                'Camera not initialized',
-                style: TextStyle(color: Colors.red),
-                textAlign: TextAlign.center,
-              ),
-            );
-          }
-          return CameraPreview(_controller!);
-        }
-        return const Center(child: CircularProgressIndicator());
-      },
     );
   }
 }
